@@ -31,18 +31,120 @@ func list_scenes(directory: String) -> Dictionary:
 	return {"ok": true, "scenes": scenes}
 
 
-# ── Mutations (stubs — replaced in Task 4) ───────────────────────────────────
+# ── Mutations ────────────────────────────────────────────────────────────────
 
-func place_scene(_body: Dictionary) -> Dictionary:
-	return {"ok": false, "error": "not yet implemented"}
+func place_scene(body: Dictionary) -> Dictionary:
+	var scene_path: String = body.get("scene_path", "")
+	if scene_path.is_empty():
+		return {"ok": false, "error": "scene_path is required"}
+
+	var packed := load(scene_path) as PackedScene
+	if not packed:
+		return {"ok": false, "error": "could not load scene: " + scene_path}
+
+	var root := _editor.get_edited_scene_root()
+	if not root:
+		return {"ok": false, "error": "no scene is currently open in the editor"}
+
+	var parent_path: String = body.get("parent_path", ".")
+	var parent: Node = root if parent_path == "." else root.get_node_or_null(parent_path)
+	if not parent:
+		return {"ok": false, "error": "parent node not found: " + parent_path}
+
+	var instance := packed.instantiate()
+	var node_name: String = body.get("name", "")
+	if not node_name.is_empty():
+		instance.name = node_name
+
+	var undo := _editor.get_undo_redo()
+	undo.create_action("Place Scene: " + scene_path.get_file())
+	undo.add_do_method(parent, "add_child", instance)
+	undo.add_do_method(instance, "set_owner", root)
+	if instance is Node3D:
+		var euler := Vector3(
+			deg_to_rad(float(body.get("rot_x", 0.0))),
+			deg_to_rad(float(body.get("rot_y", 0.0))),
+			deg_to_rad(float(body.get("rot_z", 0.0)))
+		)
+		var t := Transform3D(Basis.from_euler(euler), Vector3(
+			float(body.get("x", 0.0)),
+			float(body.get("y", 0.0)),
+			float(body.get("z", 0.0))
+		))
+		undo.add_do_method(instance, "set_transform", t)
+		undo.add_undo_method(instance, "set_transform", Transform3D.IDENTITY)
+	undo.add_undo_method(parent, "remove_child", instance)
+	undo.commit_action()
+
+	return {"ok": true, "node_path": str(root.get_path_to(instance))}
 
 
-func remove_node(_body: Dictionary) -> Dictionary:
-	return {"ok": false, "error": "not yet implemented"}
+func remove_node(body: Dictionary) -> Dictionary:
+	var node_path: String = body.get("node_path", "")
+	if node_path.is_empty():
+		return {"ok": false, "error": "node_path is required"}
+
+	var root := _editor.get_edited_scene_root()
+	if not root:
+		return {"ok": false, "error": "no scene is currently open in the editor"}
+
+	var node := root.get_node_or_null(node_path)
+	if not node:
+		return {"ok": false, "error": "node not found: " + node_path}
+
+	var parent := node.get_parent()
+	var idx := node.get_index()
+
+	var undo := _editor.get_undo_redo()
+	undo.create_action("Remove Node: " + node.name)
+	undo.add_do_method(parent, "remove_child", node)
+	undo.add_undo_method(parent, "add_child", node)
+	undo.add_undo_method(parent, "move_child", node, idx)
+	undo.add_undo_method(node, "set_owner", root)
+	undo.commit_action()
+
+	return {"ok": true, "removed": node_path}
 
 
-func set_node_transform(_body: Dictionary) -> Dictionary:
-	return {"ok": false, "error": "not yet implemented"}
+func set_node_transform(body: Dictionary) -> Dictionary:
+	var node_path: String = body.get("node_path", "")
+	if node_path.is_empty():
+		return {"ok": false, "error": "node_path is required"}
+
+	var root := _editor.get_edited_scene_root()
+	if not root:
+		return {"ok": false, "error": "no scene is currently open in the editor"}
+
+	var node := root.get_node_or_null(node_path)
+	if not node:
+		return {"ok": false, "error": "node not found: " + node_path}
+
+	if not node is Node3D:
+		return {"ok": false, "error": "node is not a Node3D: " + node_path}
+
+	var old_transform := (node as Node3D).transform
+	var euler := Vector3(
+		deg_to_rad(float(body.get("rot_x", 0.0))),
+		deg_to_rad(float(body.get("rot_y", 0.0))),
+		deg_to_rad(float(body.get("rot_z", 0.0)))
+	)
+	var new_scale := Vector3(
+		float(body.get("scale_x", 1.0)),
+		float(body.get("scale_y", 1.0)),
+		float(body.get("scale_z", 1.0))
+	)
+	var new_transform := Transform3D(
+		Basis.from_euler(euler).scaled(new_scale),
+		Vector3(float(body.get("x", 0.0)), float(body.get("y", 0.0)), float(body.get("z", 0.0)))
+	)
+
+	var undo := _editor.get_undo_redo()
+	undo.create_action("Set Transform: " + node.name)
+	undo.add_do_property(node, "transform", new_transform)
+	undo.add_undo_property(node, "transform", old_transform)
+	undo.commit_action()
+
+	return {"ok": true, "node_path": node_path}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

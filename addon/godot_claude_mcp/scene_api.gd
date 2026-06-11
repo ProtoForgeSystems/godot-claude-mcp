@@ -56,7 +56,7 @@ func place_scene(body: Dictionary) -> Dictionary:
 	if not node_name.is_empty():
 		instance.name = node_name
 
-	var undo := _editor.get_undo_redo()
+	var undo: EditorUndoRedoManager = _editor.get_undo_redo()
 	undo.create_action("Place Scene: " + scene_path.get_file())
 	undo.add_do_method(parent, "add_child", instance)
 	undo.add_do_method(instance, "set_owner", root)
@@ -95,7 +95,7 @@ func remove_node(body: Dictionary) -> Dictionary:
 	var parent := node.get_parent()
 	var idx := node.get_index()
 
-	var undo := _editor.get_undo_redo()
+	var undo: EditorUndoRedoManager = _editor.get_undo_redo()
 	undo.create_action("Remove Node: " + node.name)
 	undo.add_do_method(parent, "remove_child", node)
 	undo.add_undo_method(parent, "add_child", node)
@@ -122,7 +122,7 @@ func set_node_transform(body: Dictionary) -> Dictionary:
 	if not node is Node3D:
 		return {"ok": false, "error": "node is not a Node3D: " + node_path}
 
-	var old_transform := (node as Node3D).transform
+	var old_transform: Transform3D = (node as Node3D).transform
 	var euler := Vector3(
 		deg_to_rad(float(body.get("rot_x", 0.0))),
 		deg_to_rad(float(body.get("rot_y", 0.0))),
@@ -138,7 +138,7 @@ func set_node_transform(body: Dictionary) -> Dictionary:
 		Vector3(float(body.get("x", 0.0)), float(body.get("y", 0.0)), float(body.get("z", 0.0)))
 	)
 
-	var undo := _editor.get_undo_redo()
+	var undo: EditorUndoRedoManager = _editor.get_undo_redo()
 	undo.create_action("Set Transform: " + node.name)
 	undo.add_do_property(node, "transform", new_transform)
 	undo.add_undo_property(node, "transform", old_transform)
@@ -163,9 +163,9 @@ func _collect_nodes(root: Node, node: Node, result: Array) -> void:
 		"type": node.get_class(),
 	}
 	if node is Node3D:
-		var t := node.transform
-		var euler := t.basis.get_euler()
-		var scale := t.basis.get_scale()
+		var t: Transform3D = (node as Node3D).transform
+		var euler: Vector3 = t.basis.get_euler()
+		var scale: Vector3 = t.basis.get_scale()
 		entry["x"] = t.origin.x
 		entry["y"] = t.origin.y
 		entry["z"] = t.origin.z

@@ -33,9 +33,15 @@ func poll() -> void:
 
 func _handle(peer: StreamPeerTCP) -> void:
 	var raw := ""
-	var polls := 300  # ~5s timeout at 60fps
-	while polls > 0:
+	# Wait up to 2s for the full request. A POST body arrives in a later TCP
+	# segment than the headers, so we must actually sleep between idle polls
+	# rather than spin — otherwise the loop exits before the body lands and
+	# JSON parsing yields an empty body. Only bail on a hard-dead socket; a
+	# freshly accepted connection reports STATUS_CONNECTING on the first poll.
+	var deadline := Time.get_ticks_msec() + 2000
+	while Time.get_ticks_msec() < deadline:
 		peer.poll()
+		var status := peer.get_status()
 		var available := peer.get_available_bytes()
 		if available > 0:
 			raw += peer.get_utf8_string(available)
@@ -43,9 +49,12 @@ func _handle(peer: StreamPeerTCP) -> void:
 				var header_end := raw.find("\r\n\r\n")
 				var body_so_far := raw.substr(header_end + 4)
 				var content_length := _parse_content_length(raw.substr(0, header_end))
-				if body_so_far.length() >= content_length:
+				if body_so_far.to_utf8_buffer().size() >= content_length:
 					break
-		polls -= 1
+		elif status == StreamPeerTCP.STATUS_ERROR or status == StreamPeerTCP.STATUS_NONE:
+			break
+		else:
+			OS.delay_msec(2)
 
 	if "\r\n\r\n" not in raw:
 		_respond(peer, 400, {"ok": false, "error": "incomplete request"})
@@ -79,7 +88,13 @@ func _handle(peer: StreamPeerTCP) -> void:
 		if json.parse(body.strip_edges()) == OK:
 			body_data = json.get_data()
 
-	var result := _dispatch(method, path, params, body_data)
+	# The capture route renders across real frames, so it must be awaited;
+	# all other routes resolve synchronously.
+	var result: Dictionary
+	if method == "POST" and path == "/view/capture":
+		result = await _scene_api.capture_view(body_data)
+	else:
+		result = _dispatch(method, path, params, body_data)
 	var status := 200 if result.get("ok", false) else 400
 	_respond(peer, status, result)
 
@@ -94,6 +109,8 @@ func _parse_content_length(headers: String) -> int:
 func _dispatch(method: String, path: String, params: Dictionary, body: Dictionary) -> Dictionary:
 	if method == "GET" and path == "/ping":
 		return {"ok": true, "status": "running"}
+	if method == "GET" and path == "/scene/current":
+		return _scene_api.get_current_scene()
 	if method == "GET" and path == "/scene/tree":
 		return _scene_api.get_scene_tree(params.get("path", ""))
 	if method == "GET" and path == "/scene/list":
@@ -104,6 +121,8 @@ func _dispatch(method: String, path: String, params: Dictionary, body: Dictionar
 		return _scene_api.remove_node(body)
 	if method == "PUT" and path == "/scene/transform":
 		return _scene_api.set_node_transform(body)
+	if method == "POST" and path == "/view/capture":
+		return _scene_api.capture_view(body)
 	return {"ok": false, "error": "unknown route: %s %s" % [method, path]}
 
 

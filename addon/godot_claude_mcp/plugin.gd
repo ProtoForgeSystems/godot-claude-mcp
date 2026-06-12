@@ -11,7 +11,7 @@ var _scene_api: GodotMcpSceneApi
 
 
 func _enter_tree() -> void:
-	_scene_api = SceneApi.new(get_editor_interface())
+	_scene_api = SceneApi.new(get_editor_interface(), get_undo_redo())
 	_http_server = HttpServer.new(_scene_api)
 	_http_server.start(PORT)
 	add_tool_menu_item("Godot MCP: Status", _show_status)

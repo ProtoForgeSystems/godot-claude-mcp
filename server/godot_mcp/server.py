@@ -25,6 +25,12 @@ def _call(method: str, path: str, **kwargs) -> dict:
 
 
 @mcp.tool()
+def get_current_scene() -> dict:
+    """Return the scene tree of whichever scene is currently open in the Godot editor."""
+    return _call("GET", "/scene/current")
+
+
+@mcp.tool()
 def get_scene_tree(scene_path: str) -> dict:
     """Return the full node tree of a Godot scene including transforms.
 

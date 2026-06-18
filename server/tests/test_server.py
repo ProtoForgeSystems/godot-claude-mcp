@@ -1,186 +1,92 @@
-import httpx
+from unittest.mock import AsyncMock
+
 import pytest
-import respx
 
-from godot_mcp.server import _call, GODOT_URL
+from godot_mcp import server
+from godot_mcp.transport import GodotRpcError
 
 
-@respx.mock
-def test_call_returns_error_on_connection_refused():
-    respx.get(f"{GODOT_URL}/scene/tree").mock(side_effect=httpx.ConnectError("refused"))
-    result = _call("GET", "/scene/tree", params={"path": "res://Room4.tscn"})
+@pytest.fixture(autouse=True)
+def fake_bridge(monkeypatch):
+    fake = AsyncMock()
+    monkeypatch.setattr(server, "bridge", fake)
+    return fake
+
+
+@pytest.mark.asyncio
+async def test_call_returns_result_on_success(fake_bridge):
+    fake_bridge.call.return_value = {"node_path": "StaticBody3D"}
+    result = await server._call("add_node", {"type": "StaticBody3D"})
+    assert result == {"node_path": "StaticBody3D"}
+    fake_bridge.call.assert_awaited_once_with("add_node", {"type": "StaticBody3D"})
+
+
+@pytest.mark.asyncio
+async def test_call_wraps_godot_rpc_error(fake_bridge):
+    fake_bridge.call.side_effect = GodotRpcError({"code": -32601, "message": "Method not found: bogus"})
+    result = await server._call("bogus", {})
     assert result["ok"] is False
-    assert "not running" in result["error"].lower() or "Cannot connect" in result["error"]
+    assert "Method not found" in result["error"]
+    assert result["code"] == -32601
 
 
-@respx.mock
-def test_call_returns_error_on_timeout():
-    respx.get(f"{GODOT_URL}/scene/tree").mock(side_effect=httpx.TimeoutException("timeout"))
-    result = _call("GET", "/scene/tree", params={"path": "res://Room4.tscn"})
+@pytest.mark.asyncio
+async def test_call_wraps_connection_error(fake_bridge):
+    fake_bridge.call.side_effect = ConnectionError("Godot editor is not connected")
+    result = await server._call("get_scene_tree", {})
     assert result["ok"] is False
-    assert "timed out" in result["error"]
+    assert "not connected" in result["error"]
 
 
-@respx.mock
-def test_call_returns_response_on_success():
-    respx.get(f"{GODOT_URL}/scene/tree").mock(
-        return_value=httpx.Response(200, json={"ok": True, "root": "Room4", "nodes": []})
+@pytest.mark.asyncio
+async def test_move_node_passes_through_params(fake_bridge):
+    fake_bridge.call.return_value = {"node": "CollisionShape3D"}
+    result = await server.move_node(node_path="StaticBody/CollisionShape3D", new_parent_path=".")
+    assert result == {"node": "CollisionShape3D"}
+    fake_bridge.call.assert_awaited_once_with(
+        "move_node", {"node_path": "StaticBody/CollisionShape3D", "new_parent_path": "."}
     )
-    result = _call("GET", "/scene/tree", params={"path": "res://Room4.tscn"})
-    assert result["ok"] is True
-    assert result["root"] == "Room4"
 
 
-# ── Query tool tests ──────────────────────────────────────────────────────────
-
-from godot_mcp.server import get_scene_tree, list_scenes
-
-
-@respx.mock
-def test_get_scene_tree_success():
-    respx.get(f"{GODOT_URL}/scene/tree").mock(return_value=httpx.Response(200, json={
-        "ok": True,
-        "root": "Room4",
-        "nodes": [
-            {"path": ".", "type": "Node3D", "x": 0.0, "y": 0.0, "z": 0.0,
-             "rot_x": 0.0, "rot_y": 0.0, "rot_z": 0.0,
-             "scale_x": 1.0, "scale_y": 1.0, "scale_z": 1.0},
-        ],
-    }))
-    result = get_scene_tree("res://Content/Room4.tscn")
-    assert result["ok"] is True
-    assert result["root"] == "Room4"
-    assert len(result["nodes"]) == 1
-    assert result["nodes"][0]["path"] == "."
-
-
-@respx.mock
-def test_get_scene_tree_passes_path_param():
-    route = respx.get(f"{GODOT_URL}/scene/tree").mock(
-        return_value=httpx.Response(200, json={"ok": True, "root": "R", "nodes": []})
+@pytest.mark.asyncio
+async def test_execute_editor_script_defaults_unsafe_io_to_false(fake_bridge):
+    fake_bridge.call.return_value = {"output": []}
+    await server.execute_editor_script(code="print(1)")
+    fake_bridge.call.assert_awaited_once_with(
+        "execute_editor_script", {"code": "print(1)", "allow_unsafe_editor_io": False}
     )
-    get_scene_tree("res://Content/Room4.tscn")
-    assert route.called
-    assert route.calls[0].request.url.params["path"] == "res://Content/Room4.tscn"
 
 
-@respx.mock
-def test_list_scenes_success():
-    respx.get(f"{GODOT_URL}/scene/list").mock(return_value=httpx.Response(200, json={
-        "ok": True,
-        "scenes": [
-            "res://Assets/Props/Barrel.tscn",
-            "res://Assets/Props/Crate.tscn",
-        ],
-    }))
-    result = list_scenes("res://Assets/Props/")
-    assert result["ok"] is True
-    assert "res://Assets/Props/Barrel.tscn" in result["scenes"]
+@pytest.mark.asyncio
+async def test_play_scene_defaults_to_main(fake_bridge):
+    fake_bridge.call.return_value = {"playing": True, "mode": "main"}
+    await server.play_scene()
+    fake_bridge.call.assert_awaited_once_with("play_scene", {"mode": "main"})
 
 
-@respx.mock
-def test_list_scenes_passes_dir_param():
-    route = respx.get(f"{GODOT_URL}/scene/list").mock(
-        return_value=httpx.Response(200, json={"ok": True, "scenes": []})
-    )
-    list_scenes("res://Assets/Props/")
-    assert route.called
-    assert route.calls[0].request.url.params["dir"] == "res://Assets/Props/"
+@pytest.mark.asyncio
+async def test_stop_scene_sends_no_params(fake_bridge):
+    fake_bridge.call.return_value = {"stopped": True}
+    await server.stop_scene()
+    fake_bridge.call.assert_awaited_once_with("stop_scene", {})
 
 
-@respx.mock
-def test_get_scene_tree_propagates_plugin_error():
-    respx.get(f"{GODOT_URL}/scene/tree").mock(return_value=httpx.Response(400, json={
-        "ok": False, "error": "scene not found: res://Missing.tscn"
-    }))
-    result = get_scene_tree("res://Missing.tscn")
-    assert result["ok"] is False
-    assert "not found" in result["error"]
+@pytest.mark.asyncio
+async def test_get_editor_screenshot_omits_save_path_when_blank(fake_bridge):
+    fake_bridge.call.return_value = {"image_base64": "abc", "width": 100, "height": 100}
+    await server.get_editor_screenshot()
+    fake_bridge.call.assert_awaited_once_with("get_editor_screenshot", {})
 
 
-# ── Mutation tool tests ───────────────────────────────────────────────────────
-
-from godot_mcp.server import place_scene, remove_node, set_node_transform
-
-
-@respx.mock
-def test_place_scene_sends_correct_body():
-    route = respx.post(f"{GODOT_URL}/scene/place").mock(
-        return_value=httpx.Response(200, json={"ok": True, "node_path": "Layout/Barrel"})
-    )
-    result = place_scene(
-        scene_path="res://Assets/Props/Barrel.tscn",
-        x=1.0, y=0.0, z=2.0,
-        rot_y=45.0,
-        parent_path="Layout",
-        name="Barrel",
-    )
-    assert result["ok"] is True
-    assert result["node_path"] == "Layout/Barrel"
-    body = route.calls[0].request.read()
-    import json
-    parsed = json.loads(body)
-    assert parsed["scene_path"] == "res://Assets/Props/Barrel.tscn"
-    assert parsed["x"] == 1.0
-    assert parsed["rot_y"] == 45.0
-    assert parsed["parent_path"] == "Layout"
-    assert parsed["name"] == "Barrel"
+@pytest.mark.asyncio
+async def test_get_editor_screenshot_passes_save_path(fake_bridge):
+    fake_bridge.call.return_value = {"saved_path": "res://shot.png", "width": 100, "height": 100}
+    await server.get_editor_screenshot(save_path="res://shot.png")
+    fake_bridge.call.assert_awaited_once_with("get_editor_screenshot", {"save_path": "res://shot.png"})
 
 
-@respx.mock
-def test_place_scene_default_rotation_is_zero():
-    route = respx.post(f"{GODOT_URL}/scene/place").mock(
-        return_value=httpx.Response(200, json={"ok": True, "node_path": "Barrel"})
-    )
-    place_scene(scene_path="res://Barrel.tscn", x=0.0, y=0.0, z=0.0)
-    import json
-    body = json.loads(route.calls[0].request.read())
-    assert body["rot_x"] == 0.0
-    assert body["rot_y"] == 0.0
-    assert body["rot_z"] == 0.0
-
-
-@respx.mock
-def test_remove_node_sends_correct_body():
-    route = respx.delete(f"{GODOT_URL}/scene/node").mock(
-        return_value=httpx.Response(200, json={"ok": True, "removed": "Layout/Barrel"})
-    )
-    result = remove_node(
-        scene_path="res://Content/Room4.tscn",
-        node_path="Layout/Barrel",
-    )
-    assert result["ok"] is True
-    import json
-    body = json.loads(route.calls[0].request.read())
-    assert body["node_path"] == "Layout/Barrel"
-    assert body["scene_path"] == "res://Content/Room4.tscn"
-
-
-@respx.mock
-def test_set_node_transform_sends_all_fields():
-    route = respx.put(f"{GODOT_URL}/scene/transform").mock(
-        return_value=httpx.Response(200, json={"ok": True, "node_path": "Layout/Barrel"})
-    )
-    result = set_node_transform(
-        scene_path="res://Content/Room4.tscn",
-        node_path="Layout/Barrel",
-        x=3.0, y=0.0, z=4.0,
-        rot_x=0.0, rot_y=90.0, rot_z=0.0,
-        scale_x=2.0, scale_y=2.0, scale_z=2.0,
-    )
-    assert result["ok"] is True
-    import json
-    body = json.loads(route.calls[0].request.read())
-    assert body["x"] == 3.0
-    assert body["rot_y"] == 90.0
-    assert body["scale_x"] == 2.0
-
-
-@respx.mock
-def test_mutation_propagates_plugin_error():
-    respx.post(f"{GODOT_URL}/scene/place").mock(return_value=httpx.Response(400, json={
-        "ok": False, "error": "could not load scene: res://Missing.tscn"
-    }))
-    result = place_scene(scene_path="res://Missing.tscn", x=0.0, y=0.0, z=0.0)
-    assert result["ok"] is False
-    assert "Missing.tscn" in result["error"]
+@pytest.mark.asyncio
+async def test_get_game_screenshot_passes_save_path(fake_bridge):
+    fake_bridge.call.return_value = {"saved_path": "res://shot.png", "width": 100, "height": 100}
+    await server.get_game_screenshot(save_path="res://shot.png")
+    fake_bridge.call.assert_awaited_once_with("get_game_screenshot", {"save_path": "res://shot.png"})

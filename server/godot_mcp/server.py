@@ -16,6 +16,7 @@ yet here and why.
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -33,6 +34,39 @@ async def _call(method: str, params: dict[str, Any] | None = None) -> dict[str, 
         return {"ok": False, "error": str(e), "code": e.code, "data": e.data}
     except (ConnectionError, asyncio.TimeoutError) as e:
         return {"ok": False, "error": str(e)}
+
+
+def _gd(value: Any) -> str:
+    """Render a Python value as a GDScript literal.
+
+    JSON's string/number/bool syntax is a subset of GDScript's, so json.dumps
+    produces a valid literal for everything passed through here (strings,
+    bools, and JSON blobs that the script re-parses with JSON.parse_string).
+    """
+    return json.dumps(value)
+
+
+async def _script_json(code: str, *, allow_unsafe_editor_io: bool = False) -> dict:
+    """Run a GDScript snippet whose last statement prints a JSON payload.
+
+    execute_editor_script stringifies a script's return value with str(), which
+    turns a Dictionary into GDScript's own repr rather than JSON. Printing
+    JSON.stringify(...) and parsing the last output line here is the only
+    lossless way to get structured data back out of the editor.
+    """
+    result = await _call(
+        "execute_editor_script",
+        {"code": code, "allow_unsafe_editor_io": allow_unsafe_editor_io},
+    )
+    if result.get("ok") is False:
+        return result
+    lines = result.get("output") or []
+    if not lines:
+        return {"ok": False, "error": "Editor script produced no output.", "raw": result}
+    try:
+        return json.loads(lines[-1])
+    except (ValueError, TypeError):
+        return {"ok": False, "error": "Editor script output was not JSON.", "raw": lines}
 
 
 # ── Scene tools ────────────────────────────────────────────────────────────
@@ -447,6 +481,447 @@ async def click_button_by_text(text: str) -> dict:
         text: The button's visible text, e.g. "Start Run".
     """
     return await _call("click_button_by_text", {"text": text})
+
+
+# ── Editor viewport camera ────────────────────────────────────────────────
+#
+# Thin passthroughs — the plugin already implements both. They matter because
+# get_editor_screenshot captures whatever the viewport happens to be showing;
+# without setting the camera first, a screenshot is not a repeatable check.
+
+
+def _vec3(values: list[float] | None) -> dict[str, float] | None:
+    if values is None:
+        return None
+    if len(values) != 3:
+        raise ValueError(f"Expected 3 components (x, y, z), got {len(values)}")
+    return {"x": float(values[0]), "y": float(values[1]), "z": float(values[2])}
+
+
+@mcp.tool()
+async def get_editor_camera() -> dict:
+    """Return the 3D editor viewport camera's position, rotation, fov and clip planes.
+
+    Requires a 3D scene open in the editor; fails with "No 3D editor camera found"
+    if the active tab is 2D or a script.
+    """
+    return await _call("get_editor_camera", {})
+
+
+@mcp.tool()
+async def set_editor_camera(
+    position: list[float] | None = None,
+    rotation_degrees: list[float] | None = None,
+    look_at: list[float] | None = None,
+    fov: float | None = None,
+) -> dict:
+    """Move the 3D editor viewport camera, so a following get_editor_screenshot is
+    framed deterministically rather than wherever the viewport was left.
+
+    Only the arguments you pass are changed; the rest keep their current values.
+
+    Args:
+        position: [x, y, z] world position.
+        rotation_degrees: [x, y, z] Euler rotation. IGNORED if look_at is also
+            given — the plugin applies look_at last and it overwrites rotation.
+        look_at: [x, y, z] world point to aim at. Prefer this over rotation for
+            framing a subject.
+        fov: Vertical field of view in degrees.
+    """
+    params: dict[str, Any] = {}
+    for key, value in (
+        ("position", _vec3(position)),
+        ("rotation_degrees", _vec3(rotation_degrees)),
+        ("look_at", _vec3(look_at)),
+    ):
+        if value is not None:
+            params[key] = value
+    if fov is not None:
+        params["fov"] = fov
+    return await _call("set_editor_camera", params)
+
+
+# ── Skeleton inspection ───────────────────────────────────────────────────
+#
+# The plugin has NO skeleton or bone commands at all — animation_commands.gd
+# covers AnimationPlayer tracks and animation_tree_commands.gd covers state
+# machines, and neither touches Skeleton3D. This is implemented directly
+# against the editor's scene tree instead.
+
+_SKELETON_BONES_GD = """
+var root := EditorInterface.get_edited_scene_root()
+var out := {}
+# Typed Skeleton3D, not Node: GDScript 4 does not narrow a type from an `is`
+# check, so a Node-typed variable rejects every Skeleton3D method at parse time.
+var skel: Skeleton3D = null
+if root == null:
+	out = {"ok": false, "error": "No scene is open in the editor."}
+else:
+	var np: String = __NODE_PATH__
+	if np.is_empty():
+		# owned=false matters: an imported .glb/.fbx wrapper scene keeps its
+		# Skeleton3D owned by the instance, not by the edited root, so an
+		# owned-only search finds nothing on exactly the rigs we care about.
+		var found := root.find_children("*", "Skeleton3D", true, false)
+		if found.is_empty():
+			out = {"ok": false, "error": "No Skeleton3D found in the open scene."}
+		else:
+			skel = found[0] as Skeleton3D
+	else:
+		var node := root.get_node_or_null(NodePath(np))
+		if node == null:
+			out = {"ok": false, "error": "Node not found: " + np}
+		elif not (node is Skeleton3D):
+			out = {"ok": false, "error": "Node " + np + " is a " + node.get_class() + ", not a Skeleton3D."}
+		else:
+			skel = node as Skeleton3D
+
+if skel != null:
+	var filt: String = __FILTER__
+	var want_rest: bool = __INCLUDE_REST__
+	var want_pose: bool = __INCLUDE_POSE__
+	var bones := []
+	for i in range(skel.get_bone_count()):
+		var bname := skel.get_bone_name(i)
+		if not filt.is_empty() and not bname.to_lower().contains(filt.to_lower()):
+			continue
+		var entry := {
+			"index": i,
+			"name": bname,
+			"parent": skel.get_bone_parent(i),
+		}
+		if want_rest:
+			var rest: Transform3D = skel.get_bone_rest(i)
+			var rest_euler := rest.basis.get_euler()
+			entry["rest_position"] = [snappedf(rest.origin.x, 0.0001), snappedf(rest.origin.y, 0.0001), snappedf(rest.origin.z, 0.0001)]
+			entry["rest_rotation_degrees"] = [snappedf(rad_to_deg(rest_euler.x), 0.01), snappedf(rad_to_deg(rest_euler.y), 0.01), snappedf(rad_to_deg(rest_euler.z), 0.01)]
+		if want_pose:
+			var gp: Transform3D = skel.get_bone_global_pose(i)
+			entry["global_pose_position"] = [snappedf(gp.origin.x, 0.0001), snappedf(gp.origin.y, 0.0001), snappedf(gp.origin.z, 0.0001)]
+			var gp_euler := gp.basis.get_euler()
+			entry["global_pose_rotation_degrees"] = [snappedf(rad_to_deg(gp_euler.x), 0.01), snappedf(rad_to_deg(gp_euler.y), 0.01), snappedf(rad_to_deg(gp_euler.z), 0.01)]
+		bones.append(entry)
+
+	# SkeletonModifier3D children are reported because "the modifier silently
+	# isn't running" is the usual cause of an IK rig that looks correctly wired
+	# and does nothing. active/influence are the two fields that decide it.
+	var modifiers := []
+	for child in skel.get_children():
+		var mod := child as SkeletonModifier3D
+		if mod != null:
+			modifiers.append({
+				"name": str(mod.name),
+				"type": mod.get_class(),
+				"active": mod.active,
+				"influence": snappedf(mod.influence, 0.001),
+			})
+
+	var xf: Transform3D = skel.global_transform
+	out = {
+		"ok": true,
+		"skeleton_path": str(root.get_path_to(skel)),
+		"bone_count": skel.get_bone_count(),
+		"bones_returned": bones.size(),
+		"motion_scale": snappedf(skel.motion_scale, 0.0001),
+		"skeleton_global_position": [snappedf(xf.origin.x, 0.0001), snappedf(xf.origin.y, 0.0001), snappedf(xf.origin.z, 0.0001)],
+		"modifiers": modifiers,
+		"bones": bones,
+	}
+_mcp_print(JSON.stringify(out))
+"""
+
+
+@mcp.tool()
+async def get_skeleton_bones(
+    node_path: str = "",
+    filter: str = "",
+    include_rest: bool = False,
+    include_pose: bool = False,
+) -> dict:
+    """List a Skeleton3D's bones, plus any SkeletonModifier3D children and their state.
+
+    By default returns index/name/parent only — a humanoid rig is ~65 bones, and
+    transforms roughly quadruple the payload. Turn them on per question, and
+    filter when you can.
+
+    CAVEAT on include_pose, and it is the whole reason bone dumps mislead: the
+    pose reported here is the PRE-modifier pose. SkeletonModifier3D output
+    (TwoBoneIK3D, LookAt, physical bones) is applied downstream of what
+    get_bone_global_pose returns, so a correctly working IK solver shows up here
+    as if it did nothing. Verify IK from a rendered frame — get_editor_screenshot
+    or capture_frames — never from these numbers.
+
+    LIMITATION on "modifiers": this reads the EDITOR's open scene, so it only
+    sees modifiers authored into the .tscn. A rig that builds its TwoBoneIK3D in
+    code at runtime reports an empty list here and is not broken. Use
+    execute_game_script against a running game to inspect those.
+
+    Args:
+        node_path: Path to the Skeleton3D. Leave empty to use the first one found
+            in the open scene (searches into instanced scenes, which is where an
+            imported .glb/.fbx rig lives).
+        filter: Case-insensitive substring match on bone name, e.g. "leg".
+        include_rest: Also report each bone's rest transform.
+        include_pose: Also report each bone's current global pose. See the caveat.
+    """
+    code = (
+        _SKELETON_BONES_GD.replace("__NODE_PATH__", _gd(node_path))
+        .replace("__FILTER__", _gd(filter))
+        .replace("__INCLUDE_REST__", "true" if include_rest else "false")
+        .replace("__INCLUDE_POSE__", "true" if include_pose else "false")
+    )
+    return await _script_json(code)
+
+
+# ── Asset import settings ─────────────────────────────────────────────────
+#
+# Also absent from the plugin: nothing in commands/ reads or writes .import
+# files or calls reimport_files(). Retyping a .glb's imported root, changing
+# LOD/skin options, or re-running an import otherwise means hand-editing text
+# on disk and hand-writing the reimport script every time.
+
+_GET_IMPORT_GD = """
+var p: String = __PATH__
+var imp := p + ".import"
+var out := {}
+if not FileAccess.file_exists(imp):
+	out = {"ok": false, "error": "No .import file for " + p, "hint": "Either it is not an imported asset (.tscn/.gd/.cs have none), or the editor has not scanned it yet."}
+else:
+	var cf := ConfigFile.new()
+	var err := cf.load(imp)
+	if err != OK:
+		out = {"ok": false, "error": "Failed to read " + imp + ": " + error_string(err)}
+	else:
+		var sections := {}
+		for s in cf.get_sections():
+			var kv := {}
+			for k in cf.get_section_keys(s):
+				var v: Variant = cf.get_value(s, k)
+				var t := typeof(v)
+				if t == TYPE_BOOL or t == TYPE_INT or t == TYPE_FLOAT or t == TYPE_STRING or t == TYPE_DICTIONARY or t == TYPE_ARRAY:
+					kv[k] = v
+				elif t == TYPE_PACKED_STRING_ARRAY:
+					kv[k] = Array(v)
+				else:
+					# Anything else (Transform3D, Color, ...) is stringified rather
+					# than dropped, so it is at least visible in the output.
+					kv[k] = str(v)
+			sections[s] = kv
+		out = {"ok": true, "path": p, "import_file": imp, "importer": cf.get_value("remap", "importer", ""), "sections": sections}
+_mcp_print(JSON.stringify(out))
+"""
+
+_SET_IMPORT_GD = """
+var p: String = __PATH__
+var section: String = __SECTION__
+var opts: Dictionary = JSON.parse_string(__OPTIONS__)
+var do_reimport: bool = __REIMPORT__
+var imp := p + ".import"
+var out := {}
+if not FileAccess.file_exists(imp):
+	out = {"ok": false, "error": "No .import file for " + p}
+else:
+	var cf := ConfigFile.new()
+	var err := cf.load(imp)
+	if err != OK:
+		out = {"ok": false, "error": "Failed to read " + imp + ": " + error_string(err)}
+	else:
+		var changed := {}
+		for k in opts:
+			var v: Variant = opts[k]
+			# JSON has one number type; the importer does not. Coerce against the
+			# existing value's type so an int option does not get rewritten as
+			# "1.0" and quietly break the import.
+			if cf.has_section_key(section, k):
+				var cur: Variant = cf.get_value(section, k)
+				var ct := typeof(cur)
+				if ct == TYPE_INT and typeof(v) == TYPE_FLOAT:
+					v = int(v)
+				elif ct == TYPE_BOOL:
+					v = bool(v)
+				elif ct == TYPE_STRING and typeof(v) != TYPE_STRING:
+					v = str(v)
+			changed[k] = {"from": str(cf.get_value(section, k, null)), "to": str(v)}
+			cf.set_value(section, k, v)
+		var serr := cf.save(imp)
+		if serr != OK:
+			out = {"ok": false, "error": "Failed to write " + imp + ": " + error_string(serr)}
+		else:
+			var reimported := false
+			if do_reimport:
+				var fs := EditorInterface.get_resource_filesystem()
+				fs.update_file(p)
+				fs.reimport_files(PackedStringArray([p]))
+				reimported = true
+			out = {"ok": true, "path": p, "section": section, "changed": changed, "reimported": reimported}
+_mcp_print(JSON.stringify(out))
+"""
+
+
+@mcp.tool()
+async def get_import_settings(path: str) -> dict:
+    """Read an imported asset's .import file — importer name and every option section.
+
+    Use this before set_import_settings to learn the exact option keys, which are
+    importer-specific and not guessable (a .glb's scene importer uses
+    "nodes/root_type", "meshes/generate_lods", "skins/use_named_skins", ...).
+
+    Args:
+        path: res:// path to the SOURCE asset, e.g. "res://Content/Player/Rig.fbx"
+            — not the .import file itself.
+    """
+    return await _script_json(_GET_IMPORT_GD.replace("__PATH__", _gd(path)))
+
+
+@mcp.tool()
+async def set_import_settings(
+    path: str, options: dict[str, Any], section: str = "params", reimport: bool = True
+) -> dict:
+    """Write import options into an asset's .import file and reimport it.
+
+    This is how you retype a .glb's imported root (options={"nodes/root_type":
+    "StaticBody3D"}) or change mesh/skin import behaviour. A wrapper scene that
+    instances the asset picks up the new type automatically — there is no way to
+    retype it from the wrapper's own .tscn text.
+
+    Reimporting prints progress-dialog errors ("Do not use progress dialog (task)
+    while flushing the message queue", "Attempted to call reimport_files()
+    recursively"). Those are inherent to the plugin's deferred dispatch, not a
+    failure — verify the result by reading back the asset, not the error log.
+
+    Args:
+        path: res:// path to the source asset.
+        options: Option keys and values to set. Read get_import_settings first for
+            the valid keys; unknown keys are written and then ignored by the
+            importer rather than rejected.
+        section: .import section to write into. Leave as "params" unless you know
+            you need "remap" or "deps".
+        reimport: Reimport immediately after writing. False just edits the file.
+    """
+    code = (
+        _SET_IMPORT_GD.replace("__PATH__", _gd(path))
+        .replace("__SECTION__", _gd(section))
+        .replace("__OPTIONS__", _gd(json.dumps(options)))
+        .replace("__REIMPORT__", "true" if reimport else "false")
+    )
+    # ConfigFile.save trips the plugin's file-write guard. That guard exists to
+    # stop a script clobbering a resource the editor has open and unsaved; an
+    # .import file is never an open editor resource, so writing one is exactly
+    # the case the guard is meant to let through deliberately.
+    return await _script_json(code, allow_unsafe_editor_io=True)
+
+
+# ── Resource creation (script-class aware) ────────────────────────────────
+#
+# Deliberately supersedes the plugin's own create_resource, which gates on
+# ClassDB.class_exists() (resource_commands.gd:117). ClassDB knows engine
+# classes only, so a C# [GlobalClass] Resource — or a GDScript class_name one —
+# is rejected as "not a Resource type". add_node already handles this correctly
+# via get_global_class_list(); create_resource was never updated to match.
+
+_CREATE_RESOURCE_GD = """
+var p: String = __PATH__
+var t: String = __TYPE__
+var props: Dictionary = JSON.parse_string(__PROPERTIES__)
+var overwrite: bool = __OVERWRITE__
+var out := {}
+var res: Resource = null
+var via := ""
+if FileAccess.file_exists(p) and not overwrite:
+	out = {"ok": false, "error": "Resource already exists: " + p, "hint": "Pass overwrite=true to replace it."}
+elif ClassDB.class_exists(t) and ClassDB.is_parent_class(t, "Resource"):
+	res = ClassDB.instantiate(t)
+	via = "ClassDB"
+else:
+	var by_name := {}
+	for e in ProjectSettings.get_global_class_list():
+		by_name[str(e.get("class", ""))] = e
+	if not by_name.has(t):
+		out = {"ok": false, "error": "Unknown resource type: " + t, "hint": "Not an engine class and not a registered global class_name. For a C# type, run 'dotnet build' first — the global class list is only populated once the assembly loads."}
+	else:
+		var entry: Dictionary = by_name[t]
+		# A script class may extend another script class, so walk up until the
+		# base is something ClassDB can actually instantiate.
+		var base: String = str(entry.get("base", ""))
+		var guard := 0
+		while by_name.has(base) and guard < 32:
+			base = str(by_name[base].get("base", ""))
+			guard += 1
+		if not ClassDB.class_exists(base) or not ClassDB.is_parent_class(base, "Resource"):
+			out = {"ok": false, "error": t + " resolves to base '" + base + "', which is not a Resource."}
+		else:
+			var scr: Script = load(str(entry.get("path", "")))
+			if scr == null:
+				out = {"ok": false, "error": "Could not load the script for " + t + " at " + str(entry.get("path", ""))}
+			else:
+				# Instantiate the engine base and attach the script, rather than
+				# calling scr.new(). Only GDScript exposes new(); this path works
+				# for CSharpScript too.
+				res = ClassDB.instantiate(base)
+				res.set_script(scr)
+				via = "global_class:" + str(entry.get("language", "?"))
+
+if res != null:
+	var applied := []
+	var skipped := []
+	for k in props:
+		if k in res:
+			var v: Variant = props[k]
+			var cur: Variant = res.get(k)
+			# JSON cannot carry a Vector3/Color, so accept its GDScript literal
+			# form as a string and convert against the property's real type.
+			if typeof(v) == TYPE_STRING and typeof(cur) != TYPE_STRING and typeof(cur) != TYPE_NIL:
+				var parsed: Variant = str_to_var(v)
+				if parsed != null:
+					v = parsed
+			res.set(k, v)
+			applied.append(k)
+		else:
+			skipped.append(k)
+	var dir_abs := ProjectSettings.globalize_path(p.get_base_dir())
+	if not DirAccess.dir_exists_absolute(dir_abs):
+		DirAccess.make_dir_recursive_absolute(dir_abs)
+	var err := ResourceSaver.save(res, p)
+	if err != OK:
+		out = {"ok": false, "error": "Failed to save " + p + ": " + error_string(err)}
+	else:
+		EditorInterface.get_resource_filesystem().update_file(p)
+		out = {"ok": true, "path": p, "type": t, "instantiated_via": via, "properties_applied": applied, "properties_skipped": skipped}
+_mcp_print(JSON.stringify(out))
+"""
+
+
+@mcp.tool()
+async def create_resource(
+    path: str, type: str, properties: dict[str, Any] | None = None, overwrite: bool = False
+) -> dict:
+    """Create a .tres Resource file — including one whose type is a C# [GlobalClass]
+    or a GDScript class_name, which the plugin's own create_resource cannot do.
+
+    For a C# type the assembly must already be built and loaded by the editor;
+    otherwise the class is not in the global class list yet and this fails with
+    "Unknown resource type". Run dotnet build and let the editor pick it up first.
+
+    Property names for C# exports are the Godot-facing names (PascalCase, as
+    declared), not the C# field names. Anything unmatched comes back in
+    properties_skipped rather than failing the call — check it.
+
+    Args:
+        path: res:// destination, must end in .tres or .res.
+        type: Engine Resource class, or a registered class_name / [GlobalClass].
+        properties: Initial values. For Vector3/Color and similar, pass the
+            GDScript literal as a string, e.g. {"Offset": "Vector3(0, 1, 0)"}.
+        overwrite: Replace the file if it already exists.
+    """
+    code = (
+        _CREATE_RESOURCE_GD.replace("__PATH__", _gd(path))
+        .replace("__TYPE__", _gd(type))
+        .replace("__PROPERTIES__", _gd(json.dumps(properties or {})))
+        .replace("__OVERWRITE__", "true" if overwrite else "false")
+    )
+    # ResourceSaver.save / DirAccess mutation trip the plugin's file-write guard.
+    # Writing a new .tres at a path the caller named is the intended operation.
+    return await _script_json(code, allow_unsafe_editor_io=True)
 
 
 async def _main_async() -> None:

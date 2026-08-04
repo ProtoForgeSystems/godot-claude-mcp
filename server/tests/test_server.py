@@ -90,3 +90,117 @@ async def test_get_game_screenshot_passes_save_path(fake_bridge):
     fake_bridge.call.return_value = {"saved_path": "res://shot.png", "width": 100, "height": 100}
     await server.get_game_screenshot(save_path="res://shot.png")
     fake_bridge.call.assert_awaited_once_with("get_game_screenshot", {"save_path": "res://shot.png"})
+
+
+# ── Editor camera ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_set_editor_camera_omits_unset_params(fake_bridge):
+    fake_bridge.call.return_value = {"fov": 45.0}
+    await server.set_editor_camera(look_at=[0, 1, 0])
+    fake_bridge.call.assert_awaited_once_with(
+        "set_editor_camera", {"look_at": {"x": 0.0, "y": 1.0, "z": 0.0}}
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_editor_camera_shapes_all_vectors(fake_bridge):
+    fake_bridge.call.return_value = {}
+    await server.set_editor_camera(position=[1, 2, 3], rotation_degrees=[0, 90, 0], fov=30.0)
+    fake_bridge.call.assert_awaited_once_with(
+        "set_editor_camera",
+        {
+            "position": {"x": 1.0, "y": 2.0, "z": 3.0},
+            "rotation_degrees": {"x": 0.0, "y": 90.0, "z": 0.0},
+            "fov": 30.0,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_editor_camera_rejects_wrong_length_vector(fake_bridge):
+    with pytest.raises(ValueError, match="Expected 3 components"):
+        await server.set_editor_camera(position=[1, 2])
+    fake_bridge.call.assert_not_awaited()
+
+
+# ── GDScript-backed tools ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_script_json_parses_last_output_line(fake_bridge):
+    fake_bridge.call.return_value = {"output": ["noise", '{"ok": true, "bone_count": 65}']}
+    result = await server.get_skeleton_bones()
+    assert result == {"ok": True, "bone_count": 65}
+
+
+@pytest.mark.asyncio
+async def test_script_json_reports_non_json_output(fake_bridge):
+    fake_bridge.call.return_value = {"output": ["Parse Error: something"]}
+    result = await server.get_skeleton_bones()
+    assert result["ok"] is False
+    assert "not JSON" in result["error"]
+    assert result["raw"] == ["Parse Error: something"]
+
+
+@pytest.mark.asyncio
+async def test_script_json_reports_empty_output(fake_bridge):
+    fake_bridge.call.return_value = {"output": []}
+    result = await server.get_skeleton_bones()
+    assert result["ok"] is False
+    assert "no output" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_script_json_propagates_bridge_error(fake_bridge):
+    fake_bridge.call.side_effect = ConnectionError("Godot editor is not connected")
+    result = await server.get_skeleton_bones()
+    assert result["ok"] is False
+    assert "not connected" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_get_skeleton_bones_embeds_args_and_stays_safe(fake_bridge):
+    fake_bridge.call.return_value = {"output": ['{"ok": true}']}
+    await server.get_skeleton_bones(node_path="Rig/Skeleton3D", filter="leg", include_pose=True)
+    method, params = fake_bridge.call.await_args.args
+    assert method == "execute_editor_script"
+    assert params["allow_unsafe_editor_io"] is False
+    assert '"Rig/Skeleton3D"' in params["code"]
+    assert '"leg"' in params["code"]
+    assert "var want_pose: bool = true" in params["code"]
+
+
+@pytest.mark.asyncio
+async def test_set_import_settings_allows_unsafe_io(fake_bridge):
+    fake_bridge.call.return_value = {"output": ['{"ok": true}']}
+    await server.set_import_settings(
+        path="res://Content/Rig.fbx", options={"nodes/root_type": "StaticBody3D"}
+    )
+    _, params = fake_bridge.call.await_args.args
+    # ConfigFile.save is on the plugin's refusal list; the wrapper must opt in.
+    assert params["allow_unsafe_editor_io"] is True
+    assert "nodes/root_type" in params["code"]
+    assert "var do_reimport: bool = true" in params["code"]
+
+
+@pytest.mark.asyncio
+async def test_create_resource_allows_unsafe_io(fake_bridge):
+    fake_bridge.call.return_value = {"output": ['{"ok": true}']}
+    await server.create_resource(
+        path="res://Data/Claw.tres", type="MutationDefinition", properties={"Damage": 3}
+    )
+    _, params = fake_bridge.call.await_args.args
+    assert params["allow_unsafe_editor_io"] is True
+    assert '"MutationDefinition"' in params["code"]
+    assert "var overwrite: bool = false" in params["code"]
+
+
+@pytest.mark.asyncio
+async def test_generated_gdscript_escapes_embedded_quotes(fake_bridge):
+    """A path containing a quote must not break out of its GDScript literal."""
+    fake_bridge.call.return_value = {"output": ['{"ok": true}']}
+    await server.get_import_settings(path='res://od"d.fbx')
+    _, params = fake_bridge.call.await_args.args
+    assert r'"res://od\"d.fbx"' in params["code"]

@@ -257,6 +257,198 @@ async def get_game_screenshot(save_path: str = "") -> dict:
     return await _call("get_game_screenshot", {"save_path": save_path} if save_path else {})
 
 
+# ── Live game tools ───────────────────────────────────────────────────────
+#
+# Everything below acts on a RUNNING game, not on the editor. All of it requires
+# play_scene() first and fails with "No scene is currently playing" otherwise.
+#
+# HOW THIS ACTUALLY WORKS, because it is not a direct channel and the failure modes
+# only make sense once you know: the editor-side plugin and the running game are
+# separate processes, so they talk through files under user://. An input call writes
+# user://mcp_input_commands; the game's MCPInputService autoload polls that file and
+# feeds the events into Godot's input system. Inspection works the same way in
+# reverse via MCPGameInspector.
+#
+# Two consequences worth remembering:
+#   1. Those autoloads only exist while the [autoload] block is in project.godot,
+#      which the editor plugin injects on open and removes on close. So these tools
+#      work for editor-launched runs and are inert in an exported build — which is
+#      the intended safety property, not a limitation to work around.
+#   2. Input is delivered on the game's next polled frame, not synchronously. A
+#      screenshot taken immediately after an input call will usually predate its
+#      effect. Use capture_frames, or wait, rather than assuming ordering.
+
+
+@mcp.tool()
+async def simulate_action(action: str, pressed: bool = True, strength: float = 1.0) -> dict:
+    """Press or release a named InputMap action in the running game.
+
+    Prefer this over simulate_key: it goes through the same action names the game's
+    own code polls, so it keeps working when a keybinding changes.
+
+    Held inputs are NOT auto-released — call again with pressed=False, or use
+    simulate_sequence. Movement that never stops is almost always a forgotten release.
+
+    Args:
+        action: InputMap action name, e.g. "move_right", "jump".
+        pressed: True to press, False to release.
+        strength: Analog strength 0..1, for actions read via get_axis/get_action_strength.
+    """
+    return await _call(
+        "simulate_action", {"action": action, "pressed": pressed, "strength": strength}
+    )
+
+
+@mcp.tool()
+async def simulate_key(
+    keycode: str,
+    pressed: bool = True,
+    shift: bool = False,
+    ctrl: bool = False,
+    alt: bool = False,
+) -> dict:
+    """Press or release a physical key in the running game.
+
+    Args:
+        keycode: Godot key name, e.g. "A", "Space", "Escape".
+        pressed: True to press, False to release.
+        shift: Hold shift alongside.
+        ctrl: Hold ctrl alongside.
+        alt: Hold alt alongside.
+    """
+    return await _call(
+        "simulate_key",
+        {"keycode": keycode, "pressed": pressed, "shift": shift, "ctrl": ctrl, "alt": alt},
+    )
+
+
+@mcp.tool()
+async def simulate_sequence(events: list[dict], frame_delay: int = 1) -> dict:
+    """Play a timed list of input events, spaced frame_delay frames apart.
+
+    This is the tool for anything with duration — running for half a second, holding
+    a jump to full height, a press/release pair. Single calls cannot express timing.
+
+    Each event is a dict with a "type" of "action", "key", "mouse_button" or
+    "mouse_motion", plus that type's fields, e.g.
+        {"type": "action", "action": "move_right", "pressed": true}
+
+    Args:
+        events: Ordered event dicts.
+        frame_delay: Frames between consecutive events. 0 sends them all in one frame.
+    """
+    return await _call("simulate_sequence", {"events": events, "frame_delay": frame_delay})
+
+
+@mcp.tool()
+async def get_game_scene_tree(max_depth: int = -1, type_filter: str = "", named_only: bool = False) -> dict:
+    """Return the node tree of the RUNNING game (not the editor's open scene).
+
+    This is how you see nodes that only exist at runtime — anything spawned in code
+    rather than authored into the .tscn.
+
+    Args:
+        max_depth: Limit recursion depth, or -1 for the full tree.
+        type_filter: Only include nodes of this class, e.g. "CharacterBody3D".
+        named_only: Skip nodes with engine-generated names.
+    """
+    params: dict[str, Any] = {"max_depth": max_depth, "named_only": named_only}
+    if type_filter:
+        params["type_filter"] = type_filter
+    return await _call("get_game_scene_tree", params)
+
+
+@mcp.tool()
+async def get_game_node_properties(node_path: str) -> dict:
+    """Read a live node's properties from the running game.
+
+    Args:
+        node_path: Absolute path in the running tree, e.g. "/root/AppRoot/WorldLayer".
+    """
+    return await _call("get_game_node_properties", {"node_path": node_path})
+
+
+@mcp.tool()
+async def set_game_node_property(node_path: str, property: str, value: Any) -> dict:
+    """Write a property on a live node in the running game.
+
+    Intended for probing — nudging a tuning value and seeing the result without a
+    rebuild. It does NOT persist: the change dies with the running process, so fold
+    anything worth keeping back into the scene or the code.
+
+    Args:
+        node_path: Absolute path in the running tree.
+        property: Property name.
+        value: New value.
+    """
+    return await _call(
+        "set_game_node_property", {"node_path": node_path, "property": property, "value": value}
+    )
+
+
+@mcp.tool()
+async def execute_game_script(code: str) -> dict:
+    """Run GDScript inside the running game and return its result.
+
+    The most direct way to assert on runtime state — reach a node, read a private
+    value, call a method. Prefer a returned value over a print; printed output goes
+    to the game's log, not back through this call.
+
+    Args:
+        code: GDScript source. Use `return` to send a value back.
+    """
+    return await _call("execute_game_script", {"code": code})
+
+
+@mcp.tool()
+async def capture_frames(count: int = 5, frame_interval: int = 10, half_resolution: bool = True) -> dict:
+    """Capture several frames from the running game, spaced frame_interval apart.
+
+    Use this rather than repeated get_game_screenshot calls for anything that MOVES —
+    a walk cycle, a jump arc, a transition. One frame cannot show whether motion is
+    smooth, and round-tripping several single screenshots is far slower.
+
+    Args:
+        count: How many frames to capture.
+        frame_interval: Frames to wait between captures.
+        half_resolution: Halve the resolution. Leave on unless inspecting fine detail.
+    """
+    return await _call(
+        "capture_frames",
+        {"count": count, "frame_interval": frame_interval, "half_resolution": half_resolution},
+    )
+
+
+@mcp.tool()
+async def wait_for_node(node_path: str, timeout: float = 5.0, poll_frames: int = 5) -> dict:
+    """Block until a node exists in the running game, or the timeout elapses.
+
+    The correct way to synchronise with a load. Sleeping a fixed interval instead is
+    what makes these sessions flaky on a cold cache.
+
+    Args:
+        node_path: Absolute path to wait for.
+        timeout: Seconds before giving up.
+        poll_frames: Frames between checks.
+    """
+    return await _call(
+        "wait_for_node", {"node_path": node_path, "timeout": timeout, "poll_frames": poll_frames}
+    )
+
+
+@mcp.tool()
+async def click_button_by_text(text: str) -> dict:
+    """Find a Button in the running game by its visible label and click it.
+
+    Saves resolving a node path for menu navigation, which is most of what clicking
+    is needed for.
+
+    Args:
+        text: The button's visible text, e.g. "Start Run".
+    """
+    return await _call("click_button_by_text", {"text": text})
+
+
 async def _main_async() -> None:
     async with asyncio.TaskGroup() as tg:
         tg.create_task(bridge.serve_forever())

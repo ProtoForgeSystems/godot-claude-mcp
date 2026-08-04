@@ -4,7 +4,12 @@ version = "0.1.0"
 description = "MCP server for controlling the Godot 4 editor via Claude"
 requires-python = ">=3.11"
 dependencies = [
-    "mcp>=1.0",
+    # The upper bound is load-bearing, not caution. mcp 2.0 removed `mcp.server.fastmcp`
+    # (FastMCP moved out into its own distribution), so an unbounded ">=1.0" resolves to
+    # 2.x and the server dies at import with ModuleNotFoundError before it can bind a
+    # port — which surfaces to Claude Code only as "Connection closed". server.py is
+    # written against the 1.x FastMCP API; lift this pin only together with that port.
+    "mcp>=1.0,<2",
     "websockets>=12.0",
 ]
 

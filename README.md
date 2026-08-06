@@ -46,6 +46,33 @@ Set `GODOT_MCP_PROJECT_DIR` to override the detection. If the project can't be
 determined at all — the server was started outside any Godot project — it
 can't discriminate, so filtering is off and it talks to whoever connects.
 
+### Only one checkout may *run* the game
+
+Editors can run in parallel; games cannot. Godot derives `user://` from the
+project's **name**, not its path, so every worktree of one game resolves to the
+same directory — and the addon's screenshot, input and inspector channels are
+files in it. Two games running at once answer each other's requests, and
+`stop_scene` deletes those files, so one session stopping its game pulls the
+channel out from under the other.
+
+`user://` can't be split: Godot 4.7 has no CLI override for it, and while
+`override.cfg` moves it for the runtime, the *editor* ignores `override.cfg`
+entirely — so that route would put the two halves of the channel in different
+directories.
+
+So `play_scene` claims an exclusive run slot, and the live-game tools refuse
+while another checkout holds it. Call `get_game_run_status` to see who has it;
+poll until `available` is true, then retry.
+
+The slot is a lock file under `$XDG_CACHE_HOME/godot-claude-mcp`, keyed by
+project name, plus a scan of the process table. Both are needed: the lock makes
+two simultaneous `play_scene` calls resolve to one winner, and the process scan
+means a session that dies never wedges the machine — a held lock whose game is
+gone is reclaimed. A game is identified by `--editor-pid` in its command line.
+
+This does not fire when only *your* editor isn't playing; the addon already
+refuses those with "No scene is currently playing".
+
 ## Prerequisites
 
 - Godot 4.x with the [godot-mcp-pro](https://github.com/youichi-uda/godot-mcp-pro) addon installed and enabled (`addons/godot_mcp/`, MIT licensed, free — only its Node.js bridge is paid, and this server replaces that)

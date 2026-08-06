@@ -21,13 +21,46 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
+from godot_mcp.runslot import GameProcess, GameRunSlot, SlotHolder
 from godot_mcp.transport import GodotBridge, GodotRpcError
 
 mcp = FastMCP("godot-editor")
 bridge = GodotBridge()
 
+# Only meaningful once we know which project we serve; without that we cannot
+# tell which other checkouts share this game's user:// directory.
+run_slot: GameRunSlot | None = (
+    GameRunSlot(bridge.project_dir) if bridge.project_dir is not None else None
+)
+
+
+#: Addon commands that act on a RUNNING game through the shared user:// files,
+#: and are therefore unsafe while another checkout of this game is also running.
+#: Gated centrally rather than at each call site so that adding a live-game tool
+#: cannot silently skip the check. play_scene is absent on purpose — it claims
+#: the slot itself, atomically, instead of merely testing it.
+_LIVE_GAME_METHODS = frozenset(
+    {
+        "get_game_screenshot",
+        "capture_frames",
+        "simulate_action",
+        "simulate_key",
+        "simulate_sequence",
+        "click_button_by_text",
+        "get_game_scene_tree",
+        "get_game_node_properties",
+        "set_game_node_property",
+        "execute_game_script",
+        "wait_for_node",
+    }
+)
+
 
 async def _call(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    if method in _LIVE_GAME_METHODS:
+        refusal = await _blocked_by_another_run()
+        if refusal is not None:
+            return refusal
     try:
         return await bridge.call(method, params)
     except GodotRpcError as e:
@@ -67,6 +100,43 @@ async def _script_json(code: str, *, allow_unsafe_editor_io: bool = False) -> di
         return json.loads(lines[-1])
     except (ValueError, TypeError):
         return {"ok": False, "error": "Editor script output was not JSON.", "raw": lines}
+
+
+def _describe_blocker(blocker: SlotHolder | GameProcess) -> str:
+    if isinstance(blocker, GameProcess):
+        return f"the checkout at {blocker.project_dir} (game pid {blocker.pid})"
+    return blocker.describe()
+
+
+async def _blocked_by_another_run() -> dict | None:
+    """The refusal to return, or None if this session may touch the game.
+
+    Godot keys user:// on the project NAME, so every worktree of this game shares
+    one directory — and the addon's screenshot/input/inspector channels are files
+    in it. Two games running at once answer each other's requests. See
+    runslot.py for why this cannot be fixed by isolating user://.
+    """
+    if run_slot is None:
+        return None
+    blocker = await asyncio.to_thread(run_slot.blocker)
+    if blocker is None:
+        return None
+    return {
+        "ok": False,
+        "error": (
+            "Another checkout of this game is already running it: "
+            f"{_describe_blocker(blocker)}. Only one may run at a time — they share "
+            "one user:// directory, and the MCP screenshot, input and inspector "
+            "channels are files in it, so two games answer each other's requests. "
+            "Nothing has been started or changed."
+        ),
+        "code": "game_run_slot_busy",
+        "blocked_by": _describe_blocker(blocker),
+        "retry": (
+            "Poll get_game_run_status until available is true, then try again. "
+            "Do not work around this by driving the other checkout's game."
+        ),
+    }
 
 
 # ── Scene tools ────────────────────────────────────────────────────────────
@@ -130,17 +200,78 @@ async def add_scene_instance(scene_path: str, parent_path: str = ".", name: str 
 async def play_scene(mode: str = "main") -> dict:
     """Run a scene in the editor's game runtime.
 
+    Only one checkout of a given game may run it at a time — see
+    get_game_run_status. This refuses rather than cross-talking with another
+    worktree's game.
+
     Args:
         mode: "main" (the project's main scene), "current" (whatever's open in
             the editor), or a res:// path to a specific scene.
     """
-    return await _call("play_scene", {"mode": mode})
+    if run_slot is not None:
+        # Claim the slot BEFORE launching: two sessions calling this in the same
+        # instant would otherwise both scan, both see nothing, and both launch.
+        holder = await asyncio.to_thread(run_slot.acquire)
+        if holder is not None:
+            return {
+                "ok": False,
+                "error": (
+                    "Another checkout of this game holds the run slot: "
+                    f"{holder.describe()}. Only one may run at a time — they share one "
+                    "user:// directory, so two games answer each other's MCP requests. "
+                    "Nothing has been started."
+                ),
+                "code": "game_run_slot_busy",
+                "blocked_by": holder.describe(),
+                "retry": "Poll get_game_run_status until available is true, then try again.",
+            }
+
+    result = await _call("play_scene", {"mode": mode})
+
+    if run_slot is not None:
+        if result.get("ok") is False:
+            # The launch never happened; do not leave the slot claimed.
+            await asyncio.to_thread(run_slot.release)
+        else:
+            # Record the pid so a session that dies leaves reclaimable debris
+            # rather than a lock nobody can attribute. It is fine for this to
+            # find nothing yet — the grace period in runslot covers the gap.
+            pid = await asyncio.to_thread(run_slot.confirm_started)
+            if pid is not None:
+                result = {**result, "game_pid": pid}
+    return result
 
 
 @mcp.tool()
 async def stop_scene() -> dict:
-    """Stop the currently playing scene, if any."""
-    return await _call("stop_scene", {})
+    """Stop the currently playing scene, if any, and free the game-run slot."""
+    result = await _call("stop_scene", {})
+    if run_slot is not None:
+        await asyncio.to_thread(run_slot.release)
+    return result
+
+
+@mcp.tool()
+async def get_game_run_status() -> dict:
+    """Who, if anyone, is currently running this game — across every checkout.
+
+    Only one checkout of a game may run it at a time, because Godot derives
+    user:// from the project name rather than its path, so every worktree shares
+    one directory and the MCP game channels are files in it.
+
+    Poll this after a play_scene refusal: when "available" is true the slot is
+    free. It reports the process table as well as the lock, so a game started
+    from the editor's own UI is visible too.
+    """
+    if run_slot is None:
+        return {
+            "available": True,
+            "note": (
+                "This server could not determine which Godot project it serves, so it "
+                "does not arbitrate game runs. Set GODOT_MCP_PROJECT_DIR to enable it."
+            ),
+        }
+    return await asyncio.to_thread(run_slot.status)
 
 
 # ── Node tools ────────────────────────────────────────────────────────────

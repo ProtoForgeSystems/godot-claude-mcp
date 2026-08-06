@@ -211,18 +211,18 @@ async def play_scene(mode: str = "main") -> dict:
     if run_slot is not None:
         # Claim the slot BEFORE launching: two sessions calling this in the same
         # instant would otherwise both scan, both see nothing, and both launch.
-        holder = await asyncio.to_thread(run_slot.acquire)
-        if holder is not None:
+        blocker = await asyncio.to_thread(run_slot.acquire)
+        if blocker is not None:
             return {
                 "ok": False,
                 "error": (
-                    "Another checkout of this game holds the run slot: "
-                    f"{holder.describe()}. Only one may run at a time — they share one "
-                    "user:// directory, so two games answer each other's MCP requests. "
+                    "Another checkout of this game is already running it: "
+                    f"{_describe_blocker(blocker)}. Only one may run at a time — they share "
+                    "one user:// directory, so two games answer each other's MCP requests. "
                     "Nothing has been started."
                 ),
                 "code": "game_run_slot_busy",
-                "blocked_by": holder.describe(),
+                "blocked_by": _describe_blocker(blocker),
                 "retry": "Poll get_game_run_status until available is true, then try again.",
             }
 

@@ -80,6 +80,32 @@ def test_an_editor_is_not_mistaken_for_a_game():
     assert parse_ps_output(REAL_EDITOR_LINE) == []
 
 
+def test_a_game_launched_from_a_command_line_counts():
+    """The mirror-image bug: classifying on the presence of --editor-pid misses
+    every game the editor did not spawn. This is the project's documented way of
+    rendering a clip, and it shares user:// exactly the same way."""
+    line = (
+        " 160001 /home/u/Applications/godot/Godot_v4.7.1-stable_mono_linux.x86_64 "
+        "--path /repo/game -- --driver=crouch --write-movie /tmp/out.avi"
+    )
+    games = parse_ps_output(line)
+    assert [g.pid for g in games] == [160001]
+
+
+@pytest.mark.parametrize(
+    "flag",
+    ["--build-solutions", "--export-release", "--export-debug", "--script", "--doctool"],
+)
+def test_tool_invocations_are_not_running_games(flag):
+    """A compile or an export names a project path without running it. Counting
+    those would make every build look like a collision."""
+    line = (
+        f" 160002 /home/u/Applications/godot/Godot_v4.7.1-stable_mono_linux.x86_64 "
+        f"--headless --path /repo/game {flag} probe.gd --quit"
+    )
+    assert parse_ps_output(line) == []
+
+
 def test_both_lines_together_yield_only_the_game():
     games = parse_ps_output(f"{REAL_EDITOR_LINE}\n{REAL_GAME_LINE}")
     assert [g.pid for g in games] == [157603]
@@ -147,11 +173,29 @@ def test_a_second_worktree_is_refused(tmp_path):
 
     b, b_games = slot_for(tree, tmp_path, clock=clock)
     b_games.append(GameProcess(pid=4242, project_dir=main))
-    holder = b.acquire()
-    assert holder is not None
-    assert holder.project_dir == main
-    assert holder.game_pid == 4242
-    assert str(main) in holder.describe()
+    blocker = b.acquire()
+    # A visible process outranks the lock as the reason for the refusal — it is
+    # the more direct evidence, and it is the only evidence when the game was
+    # started outside MCP.
+    assert isinstance(blocker, GameProcess)
+    assert blocker.project_dir == main
+    assert blocker.pid == 4242
+
+
+def test_acquire_is_refused_by_a_game_that_never_claimed_the_slot(tmp_path):
+    """Only play_scene claims the lock, so a game started by F5 in the
+    architect's own editor — or from a shell — holds nothing. The process table
+    is what makes those routes count; the lock alone would let us launch a
+    second game straight into the shared user://."""
+    main = make_project(tmp_path, "repo", "game", name="Meat Mutant")
+    tree = make_project(tmp_path, "repo", ".worktrees", "x", "game", name="Meat Mutant")
+    slot, games = slot_for(tree, tmp_path)
+    games.append(GameProcess(pid=777, project_dir=main))
+
+    blocker = slot.acquire()
+    assert isinstance(blocker, GameProcess)
+    assert blocker.pid == 777
+    assert not slot.lock_path.exists()  # nothing claimed on a refusal
 
 
 def test_reacquiring_our_own_slot_is_not_a_conflict(tmp_path):

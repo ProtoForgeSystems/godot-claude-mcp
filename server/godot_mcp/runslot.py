@@ -36,10 +36,22 @@ truth: a held lock whose game is gone is debris and gets reclaimed. That keeps
 "a game is running" defined by exactly one thing — a live process — while still
 closing the start race.
 
-A game launched by the editor is identified by **`--editor-pid`** in its command
-line, which is positive evidence rather than the absence of `--editor`. Do not
-switch this to `"--editor" not in cmdline`: `--editor-pid` contains `--editor`
-as a substring, so that test reports every game as an editor.
+WHAT COUNTS AS A RUNNING GAME
+-----------------------------
+Any Godot process running a project that is not the editor itself. Two traps,
+both of which have bitten:
+
+- `--editor` must be matched as a **whole field**. A substring test also matches
+  an editor-spawned game, whose command line carries `--editor-pid`, so every
+  game reads as an editor and the guard never fires.
+- Do **not** invert that into "a game is a process carrying `--editor-pid`".
+  That flag appears only on a game the *editor* spawned. A game launched from a
+  command line — `godot --path game -- --driver=<name> --write-movie …`, which
+  is how this project renders clips — carries neither flag, and it shares
+  `user://` in exactly the same way. Missing it misses the collision.
+
+Tool invocations (`--build-solutions`, `--export-*`, `--script`, …) name a
+project path without running the game, so they are skipped rather than counted.
 """
 
 from __future__ import annotations
@@ -62,6 +74,21 @@ UNCONFIRMED_GRACE_SECONDS = 45.0
 #: How long a scan of the process table is reused. The live-game tools check the
 #: slot on every call, and `ps` is far too expensive to run per call.
 SCAN_TTL_SECONDS = 2.0
+
+#: Godot modes that name a project path without ever running the game. A build
+#: or an export must not read as a running game, or every compile would look
+#: like a collision.
+_TOOL_MODE_FLAGS = frozenset(
+    {
+        "--build-solutions",
+        "--export-release",
+        "--export-debug",
+        "--export-pack",
+        "--script",
+        "--doctool",
+        "--dump-extension-api",
+    }
+)
 
 _CONFIG_NAME = re.compile(r'^\s*config/name\s*=\s*"(?P<name>.*)"\s*$', re.MULTILINE)
 _UNSAFE_IN_FILENAME = re.compile(r"[^A-Za-z0-9._-]+")
@@ -120,13 +147,13 @@ def parse_ps_output(text: str) -> list[GameProcess]:
         fields = line.split()
         if len(fields) < 3:
             continue
-        # See the module docstring: this tests for --editor-pid as an exact
-        # field rather than for the absence of --editor, because "--editor" is
-        # a prefix of "--editor-pid" and a substring test calls every game an
-        # editor. That bug shipped once already.
-        if "--editor-pid" not in fields:
-            continue
         if "godot" not in fields[1].lower():
+            continue
+        # Whole-field match, never a substring: see the module docstring for
+        # both halves of this and why neither may be "simplified".
+        if "--editor" in fields:
+            continue
+        if not _TOOL_MODE_FLAGS.isdisjoint(fields):
             continue
         try:
             path_index = fields.index("--path")
@@ -277,12 +304,21 @@ class GameRunSlot:
             return False
         return (self._clock() - holder.acquired_at) > UNCONFIRMED_GRACE_SECONDS
 
-    def acquire(self) -> SlotHolder | None:
-        """Claim the slot, or return the holder that already has it.
+    def acquire(self) -> SlotHolder | GameProcess | None:
+        """Claim the slot, or return whatever already has it.
 
         Returns None on success. Returning the blocker rather than raising
         keeps the caller's error message specific about who is in the way.
         """
+        # The lock alone is not enough to decide this. Only play_scene claims
+        # it, so a game started any other way — F5 in the architect's own
+        # editor, or `godot --path … -- --driver=… --write-movie` from a shell —
+        # holds no lock at all while sharing user:// exactly the same way.
+        # Checking the process table first is what makes those routes count.
+        foreign = self.foreign_game(fresh=True)
+        if foreign is not None:
+            return foreign
+
         self._lock_dir.mkdir(parents=True, exist_ok=True)
         holder = SlotHolder(
             project_dir=self._project_dir, game_pid=None, acquired_at=self._clock()

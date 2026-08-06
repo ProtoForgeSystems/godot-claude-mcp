@@ -24,6 +24,28 @@ folder is the original (pre-rewrite) custom plugin and is no longer used —
 install [godot-mcp-pro's addon](https://github.com/youichi-uda/godot-mcp-pro)
 in your Godot project instead.
 
+### Running more than one editor
+
+The addon doesn't pick a port — it opens a peer on **every** port in
+6505-6514 at once. So every Godot editor on the machine connects to every
+server on the machine, which matters as soon as you have two: one editor per
+git worktree, or a second unrelated game that also has the addon installed.
+
+A server that just kept the most recent connection would execute its commands
+against an arbitrary editor, and since the addon force-reconnects after a 30s
+heartbeat gap, *which* editor changes during a session. The symptom isn't a
+failed call — it's a scene edit silently landing in the wrong checkout.
+
+So this server figures out which project it belongs to (the nearest
+`project.godot` at or above its working directory, else a shallow scan below
+it), asks each editor that connects which project it has open via the stock
+`get_export_info` command, and talks only to the one that matches. Other
+editors stay connected and idle. No addon changes are needed.
+
+Set `GODOT_MCP_PROJECT_DIR` to override the detection. If the project can't be
+determined at all — the server was started outside any Godot project — it
+can't discriminate, so filtering is off and it talks to whoever connects.
+
 ## Prerequisites
 
 - Godot 4.x with the [godot-mcp-pro](https://github.com/youichi-uda/godot-mcp-pro) addon installed and enabled (`addons/godot_mcp/`, MIT licensed, free — only its Node.js bridge is paid, and this server replaces that)

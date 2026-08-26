@@ -125,8 +125,8 @@ def test_a_game_without_a_path_is_ignored():
 
 
 def test_read_project_name(tmp_path):
-    project = make_project(tmp_path, "game", name="Meat Mutant")
-    assert read_project_name(project) == "Meat Mutant"
+    project = make_project(tmp_path, "game", name="Trauma Trigger")
+    assert read_project_name(project) == "Trauma Trigger"
 
 
 def test_read_project_name_missing_file(tmp_path):
@@ -135,15 +135,15 @@ def test_read_project_name_missing_file(tmp_path):
 
 def test_worktrees_of_one_game_share_a_lock(tmp_path):
     """The lock is keyed by project NAME, because user:// is."""
-    main = make_project(tmp_path, "repo", "game", name="Meat Mutant")
-    tree = make_project(tmp_path, "repo", ".worktrees", "x", "game", name="Meat Mutant")
+    main = make_project(tmp_path, "repo", "game", name="Trauma Trigger")
+    tree = make_project(tmp_path, "repo", ".worktrees", "x", "game", name="Trauma Trigger")
     a, _ = slot_for(main, tmp_path)
     b, _ = slot_for(tree, tmp_path)
     assert a.lock_path == b.lock_path
 
 
 def test_a_different_game_gets_a_different_lock(tmp_path):
-    mine = make_project(tmp_path, "mine", "game", name="Meat Mutant")
+    mine = make_project(tmp_path, "mine", "game", name="Trauma Trigger")
     other = make_project(tmp_path, "other", "client", name="Fendrel")
     a, _ = slot_for(mine, tmp_path)
     b, _ = slot_for(other, tmp_path)
@@ -163,8 +163,8 @@ def test_acquire_succeeds_when_free(tmp_path):
 
 
 def test_a_second_worktree_is_refused(tmp_path):
-    main = make_project(tmp_path, "repo", "game", name="Meat Mutant")
-    tree = make_project(tmp_path, "repo", ".worktrees", "x", "game", name="Meat Mutant")
+    main = make_project(tmp_path, "repo", "game", name="Trauma Trigger")
+    tree = make_project(tmp_path, "repo", ".worktrees", "x", "game", name="Trauma Trigger")
     clock = FakeClock()
     a, a_games = slot_for(main, tmp_path, clock=clock)
     assert a.acquire() is None
@@ -187,8 +187,8 @@ def test_acquire_is_refused_by_a_game_that_never_claimed_the_slot(tmp_path):
     architect's own editor — or from a shell — holds nothing. The process table
     is what makes those routes count; the lock alone would let us launch a
     second game straight into the shared user://."""
-    main = make_project(tmp_path, "repo", "game", name="Meat Mutant")
-    tree = make_project(tmp_path, "repo", ".worktrees", "x", "game", name="Meat Mutant")
+    main = make_project(tmp_path, "repo", "game", name="Trauma Trigger")
+    tree = make_project(tmp_path, "repo", ".worktrees", "x", "game", name="Trauma Trigger")
     slot, games = slot_for(tree, tmp_path)
     games.append(GameProcess(pid=777, project_dir=main))
 
@@ -208,8 +208,8 @@ def test_reacquiring_our_own_slot_is_not_a_conflict(tmp_path):
 def test_a_dead_holder_is_reclaimed(tmp_path):
     """A session that died between acquire and release must not wedge the
     machine — the process table, not the lock, decides what is running."""
-    main = make_project(tmp_path, "repo", "game", name="Meat Mutant")
-    tree = make_project(tmp_path, "repo", ".worktrees", "x", "game", name="Meat Mutant")
+    main = make_project(tmp_path, "repo", "game", name="Trauma Trigger")
+    tree = make_project(tmp_path, "repo", ".worktrees", "x", "game", name="Trauma Trigger")
     clock = FakeClock()
     dead, dead_games = slot_for(main, tmp_path, clock=clock)
     dead.acquire()
@@ -224,8 +224,8 @@ def test_a_dead_holder_is_reclaimed(tmp_path):
 def test_an_unconfirmed_holder_is_respected_during_the_grace_period(tmp_path):
     """A launch takes time. Reclaiming instantly would let a second session
     barge in while the first game is still starting."""
-    main = make_project(tmp_path, "repo", "game", name="Meat Mutant")
-    tree = make_project(tmp_path, "repo", ".worktrees", "x", "game", name="Meat Mutant")
+    main = make_project(tmp_path, "repo", "game", name="Trauma Trigger")
+    tree = make_project(tmp_path, "repo", ".worktrees", "x", "game", name="Trauma Trigger")
     clock = FakeClock()
     starting, _ = slot_for(main, tmp_path, clock=clock)
     starting.acquire()  # no pid recorded yet, no process visible yet
@@ -238,8 +238,8 @@ def test_an_unconfirmed_holder_is_respected_during_the_grace_period(tmp_path):
 
 
 def test_release_only_removes_our_own_lock(tmp_path):
-    main = make_project(tmp_path, "repo", "game", name="Meat Mutant")
-    tree = make_project(tmp_path, "repo", ".worktrees", "x", "game", name="Meat Mutant")
+    main = make_project(tmp_path, "repo", "game", name="Trauma Trigger")
+    tree = make_project(tmp_path, "repo", ".worktrees", "x", "game", name="Trauma Trigger")
     clock = FakeClock()
     owner, owner_games = slot_for(main, tmp_path, clock=clock)
     owner.acquire()
@@ -276,8 +276,8 @@ def test_a_corrupt_lock_is_reclaimed(tmp_path):
 
 def test_a_foreign_game_blocks_even_with_no_lock(tmp_path):
     """Covers a game started from the editor's own UI, which never touches MCP."""
-    main = make_project(tmp_path, "repo", "game", name="Meat Mutant")
-    tree = make_project(tmp_path, "repo", ".worktrees", "x", "game", name="Meat Mutant")
+    main = make_project(tmp_path, "repo", "game", name="Trauma Trigger")
+    tree = make_project(tmp_path, "repo", ".worktrees", "x", "game", name="Trauma Trigger")
     slot, games = slot_for(tree, tmp_path)
     games.append(GameProcess(pid=99, project_dir=main))
     blocker = slot.blocker()
@@ -294,7 +294,7 @@ def test_our_own_game_does_not_block_us(tmp_path):
 
 def test_an_unrelated_game_does_not_block_us(tmp_path):
     """Fendrel running is none of this game's business."""
-    mine = make_project(tmp_path, "mine", "game", name="Meat Mutant")
+    mine = make_project(tmp_path, "mine", "game", name="Trauma Trigger")
     other = make_project(tmp_path, "other", "client", name="Fendrel")
     slot, games = slot_for(mine, tmp_path)
     games.append(GameProcess(pid=99, project_dir=other))
@@ -302,8 +302,8 @@ def test_an_unrelated_game_does_not_block_us(tmp_path):
 
 
 def test_status_reports_availability_and_who_holds_it(tmp_path):
-    main = make_project(tmp_path, "repo", "game", name="Meat Mutant")
-    tree = make_project(tmp_path, "repo", ".worktrees", "x", "game", name="Meat Mutant")
+    main = make_project(tmp_path, "repo", "game", name="Trauma Trigger")
+    tree = make_project(tmp_path, "repo", ".worktrees", "x", "game", name="Trauma Trigger")
     clock = FakeClock()
     owner, owner_games = slot_for(main, tmp_path, clock=clock)
     owner.acquire()
